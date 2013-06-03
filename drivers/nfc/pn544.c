@@ -368,8 +368,6 @@ static long pn544_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	mutex_lock(&info->mutex);
 	pdata = info->i2c_dev->dev.platform_data;
 
-	switch (cmd) {
-	case PN544_SET_PWR:
 		pdata = client->dev.platform_data;
 
 		dev_dbg(&client->dev, "%s:  PN544_SET_PWR_MODE\n", __func__);
@@ -397,12 +395,8 @@ static long pn544_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			r = -EINVAL;
 			goto out;
 		}
-		break;
-	default:
-		printk("[PN544] The IOCTL isn't exist!!\n");
-		r = -EINVAL;
-		break;
-	}
+
+
 out:
 	mutex_unlock(&info->mutex);
 	return r;
