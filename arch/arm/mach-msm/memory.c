@@ -291,7 +291,13 @@ static void __init reserve_memory_for_mempools(void)
 				 * means is that we are carving the memory pool
 				 * out of multiple contiguous memory banks.
 				 */
-				mt->start = mb->start + (size - mt->size);
+				mt->start = memblock_find_in_size(mt->size) - (mt->size);
+				if(mt->start < (reserve_info->fixed_area_start + reserve_info->fixed_area_size)) {
+					pr_info("%lx Overlay with MSM fixed Area ", mt->start);
+					mt->start = (reserve_info->fixed_area_start + reserve_info->fixed_area_size + SECTION_SIZE)
+								& SECTION_MASK;
+					pr_info("Rebase Address to %lx \n", mt->start);
+				}
 				ret = memblock_remove(mt->start, mt->size);
 				BUG_ON(ret);
 				break;

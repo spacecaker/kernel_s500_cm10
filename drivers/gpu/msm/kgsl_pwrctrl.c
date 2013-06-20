@@ -132,6 +132,18 @@ void kgsl_pwrctrl_pwrlevel_change(struct kgsl_device *device,
 }
 EXPORT_SYMBOL(kgsl_pwrctrl_pwrlevel_change);
 
+#ifdef CONFIG_ARCH_ACER_MSM8960
+#define LIMIT_MODE_FREQ	"300000000"
+#define NORMAL_MODE_FREQ	"400000000"
+#define VAL_LIMIT_MODE	300000000
+#define VAL_NORMAL_MODE	400000000
+static int gpu_limit_mode;
+static unsigned long gpu_limit_freq = VAL_NORMAL_MODE;
+static unsigned long gpu_user_freq = VAL_NORMAL_MODE;  //adjust by user
+static unsigned long gpu_power_freq = VAL_NORMAL_MODE;  //adjust for power issue
+static struct kgsl_device *private_kgsl_3d_dev;
+#endif
+
 static int __gpuclk_store(int max, struct device *dev,
 						  struct device_attribute *attr,
 						  const char *buf, size_t count)
@@ -147,6 +159,19 @@ static int __gpuclk_store(int max, struct device *dev,
 	ret = sscanf(buf, "%ld", &val);
 	if (ret != 1)
 		return count;
+
+#ifdef CONFIG_ARCH_ACER_MSM8960
+	if (max) {
+		if (gpu_user_freq && (gpu_user_freq < gpu_limit_freq))
+			val = gpu_user_freq;
+		else
+			val = gpu_limit_freq;
+
+		if (gpu_power_freq < val)
+			val = gpu_power_freq;
+	}
+	pr_info("%s:: max value is changed:%ld\n", __func__, val);
+#endif
 
 	mutex_lock(&device->mutex);
 	for (i = 0; i < pwr->num_pwrlevels - 1; i++) {
@@ -176,10 +201,148 @@ done:
 	return count;
 }
 
+#ifdef CONFIG_ARCH_ACER_MSM8960
+static int kgsl_limit_mode_store(struct device *dev,
+					 struct device_attribute *attr,
+					 const char *buf, size_t count)
+{
+	unsigned long tmp;
+	char *last = NULL;
+
+	tmp = simple_strtoul(buf, &last, 0);
+	if ((tmp == 1) && (gpu_limit_mode == 0)) {
+		gpu_limit_mode = 1;
+		gpu_limit_freq = VAL_LIMIT_MODE;
+	} else if ((tmp == 0) && (gpu_limit_mode == 1)) {
+		gpu_limit_mode = 0;
+		gpu_limit_freq = VAL_NORMAL_MODE;
+	} else {
+		pr_info("%s::get wrong value:%ld [%d]\n", __func__, tmp,
+				gpu_limit_mode);
+		return count;
+	}
+	return __gpuclk_store(1, dev, attr, LIMIT_MODE_FREQ, sizeof(LIMIT_MODE_FREQ));
+}
+
+static int kgsl_limit_mode_show(struct device *dev,
+					struct device_attribute *attr,
+					char *buf)
+{
+	return snprintf(buf, PAGE_SIZE, "%d", gpu_limit_mode);
+}
+
+static void kgsl_set_max_rate(struct kgsl_device* device)
+{
+	unsigned long val, delta = 5000000;
+	int i;
+	struct kgsl_pwrctrl *pwr;
+
+	if (device == NULL)
+		return;
+
+	pwr = &device->pwrctrl;
+	if (gpu_user_freq && (gpu_user_freq < gpu_limit_freq))
+		val = gpu_user_freq;
+	else
+		val = gpu_limit_freq;
+	if (gpu_user_freq && (gpu_power_freq < val))
+		val = gpu_power_freq;
+
+	pr_info("%s:: max value is changed:%ld\n", __func__, val);
+	mutex_lock(&device->mutex);
+	for (i = 0; i < pwr->num_pwrlevels - 1; i++) {
+		if (abs(pwr->pwrlevels[i].gpu_freq - val) < delta) {
+				pwr->thermal_pwrlevel = i;
+			break;
+		}
+	}
+
+	if (i == pwr->num_pwrlevels - 1)
+		goto done;
+
+	if (pwr->pwrlevels[pwr->active_pwrlevel].gpu_freq >
+	    pwr->pwrlevels[pwr->thermal_pwrlevel].gpu_freq)
+		kgsl_pwrctrl_pwrlevel_change(device, pwr->thermal_pwrlevel);
+done:
+	mutex_unlock(&device->mutex);
+}
+
+/* max_clk: only accept 300/400/200 */
+int kgsl_3d_max_clk_set(unsigned int max_clk)
+{
+	static int pre_max_clk = 400;
+	if (pre_max_clk == max_clk)
+		return 0;
+	if ((max_clk != 400) && (max_clk != 300) && (max_clk != 200))
+		return -EINVAL;
+	pre_max_clk = max_clk;
+	gpu_power_freq = max_clk * 1000000;
+	kgsl_set_max_rate(private_kgsl_3d_dev);
+	return 0;
+}
+static int kgsl_max_clk_pwr_show(struct device *dev,
+					struct device_attribute *attr,
+					char *buf)
+{
+	return snprintf(buf, PAGE_SIZE, "%ld", gpu_power_freq);
+}
+static int kgsl_max_clk_pwr_store(struct device *dev,
+					 struct device_attribute *attr,
+					 const char *buf, size_t count)
+{
+	int ret, i, delta = 5000000;
+	unsigned long val;
+	struct kgsl_device *device = kgsl_device_from_dev(dev);
+	struct kgsl_pwrctrl *pwr;
+
+	if (device == NULL)
+		return 0;
+
+	ret = sscanf(buf, "%ld", &val);
+	if (ret != 1)
+		return count;
+
+	pwr = &device->pwrctrl;
+	for (i = 0; i < pwr->num_pwrlevels - 1; i++) {
+		if (abs(pwr->pwrlevels[i].gpu_freq - val) < delta) {
+			break;
+		}
+	}
+
+	if (i == pwr->num_pwrlevels - 1)
+		return count;
+	gpu_power_freq = val;
+	return __gpuclk_store(1, dev, attr, buf, count);
+}
+#endif
+
 static int kgsl_pwrctrl_max_gpuclk_store(struct device *dev,
 					 struct device_attribute *attr,
 					 const char *buf, size_t count)
 {
+#ifdef CONFIG_ARCH_ACER_MSM8960
+	int ret, i, delta = 5000000;
+	unsigned long val;
+	struct kgsl_device *device = kgsl_device_from_dev(dev);
+	struct kgsl_pwrctrl *pwr;
+
+	if (device == NULL)
+		return 0;
+
+	ret = sscanf(buf, "%ld", &val);
+	if (ret != 1)
+		return count;
+	pwr = &device->pwrctrl;
+	for (i = 0; i < pwr->num_pwrlevels - 1; i++) {
+		if (abs(pwr->pwrlevels[i].gpu_freq - val) < delta) {
+			break;
+		}
+	}
+
+	if (i == pwr->num_pwrlevels - 1)
+		return count;
+	gpu_user_freq = val;
+#endif
 	return __gpuclk_store(1, dev, attr, buf, count);
 }
 
@@ -360,6 +523,11 @@ DEVICE_ATTR(gpubusy, 0444, kgsl_pwrctrl_gpubusy_show,
 DEVICE_ATTR(gputop, 0444, kgsl_pwrctrl_gputop_show,
 	NULL);
 
+#ifdef CONFIG_ARCH_ACER_MSM8960
+DEVICE_ATTR(limit_mode, 0644, kgsl_limit_mode_show, kgsl_limit_mode_store);
+DEVICE_ATTR(max_clk_pwr_mode, 0644, kgsl_max_clk_pwr_show, kgsl_max_clk_pwr_store);
+#endif
+
 static const struct device_attribute *pwrctrl_attr_list[] = {
 	&dev_attr_gpuclk,
 	&dev_attr_max_gpuclk,
@@ -367,6 +535,10 @@ static const struct device_attribute *pwrctrl_attr_list[] = {
 	&dev_attr_idle_timer,
 	&dev_attr_gpubusy,
 	&dev_attr_gputop,
+#ifdef CONFIG_ARCH_ACER_MSM8960
+	&dev_attr_limit_mode,
+	&dev_attr_max_clk_pwr_mode,
+#endif
 	NULL
 };
 
@@ -564,6 +736,12 @@ int kgsl_pwrctrl_init(struct kgsl_device *device)
 		container_of(device->parentdev, struct platform_device, dev);
 	struct kgsl_pwrctrl *pwr = &device->pwrctrl;
 	struct kgsl_device_platform_data *pdata = pdev->dev.platform_data;
+
+#ifdef CONFIG_ARCH_ACER_MSM8960
+	if (!strcmp(device->name, "kgsl-3d0")) {
+		private_kgsl_3d_dev = device;
+	}
+#endif
 
 	/*acquire clocks */
 	for (i = 0; i < KGSL_MAX_CLKS; i++) {
