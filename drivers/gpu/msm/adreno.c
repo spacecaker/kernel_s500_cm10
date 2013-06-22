@@ -359,6 +359,14 @@ static void adreno_iommu_setstate(struct kgsl_device *device,
 				device->mmu.setstate_memory.gpuaddr +
 				KGSL_IOMMU_SETSTATE_NOP_OFFSET);
 		}
+		/* invalidate all base pointers */
+		*cmds++ = cp_type3_packet(CP_INVALIDATE_STATE, 1);
+		*cmds++ = 0x7fff;
+
+		if (flags & KGSL_MMUFLAGS_TLBFLUSH)
+			cmds += __adreno_add_idle_indirect_cmds(cmds,
+				device->mmu.setstate_memory.gpuaddr +
+				KGSL_IOMMU_SETSTATE_NOP_OFFSET);
 	}
 	if (flags & KGSL_MMUFLAGS_TLBFLUSH) {
 		/*
@@ -410,6 +418,13 @@ static void adreno_iommu_setstate(struct kgsl_device *device,
 
 	sizedwords += (cmds - &link[0]);
 	if (sizedwords) {
+/*
+		 * add an interrupt at the end of commands so that the smmu
+		 * disable clock off function will get called
+		 */
+		*cmds++ = cp_type3_packet(CP_INTERRUPT, 1);
+		*cmds++ = CP_INT_CNTL__RB_INT_MASK;
+
 		/* invalidate all base pointers */
 		*cmds++ = cp_type3_packet(CP_INVALIDATE_STATE, 1);
 		*cmds++ = 0x7fff;
@@ -422,14 +437,13 @@ static void adreno_iommu_setstate(struct kgsl_device *device,
 		kgsl_mmu_disable_clk_on_ts(&device->mmu,
 		adreno_dev->ringbuffer.timestamp[KGSL_MEMSTORE_GLOBAL], true);
 	}
-done:
-	if (num_iommu_units)
-		kfree(reg_map_array);
-
 	if (sizedwords > (sizeof(link)/sizeof(unsigned int))) {
 		KGSL_DRV_ERR(device, "Temp command buffer overflow\n");
 		BUG();
 	}
+done:
+	if (num_iommu_units)
+		kfree(reg_map_array);
 }
 
 static void adreno_gpummu_setstate(struct kgsl_device *device,
@@ -554,16 +568,53 @@ static void adreno_setstate(struct kgsl_device *device,
 static unsigned int
 a3xx_getchipid(struct kgsl_device *device)
 {
-	struct kgsl_device_platform_data *pdata =
-		kgsl_device_get_drvdata(device);
+	unsigned int majorid = 0, minorid = 0, patchid = 0;
 
 	/*
-	 * All current A3XX chipids are detected at the SOC level. Leave this
-	 * function here to support any future GPUs that have working
-	 * chip ID registers
+	 * We could detect the chipID from the hardware but it takes multiple
+	 * registers to find the right combination. Since we traffic exclusively
+	 * in system on chips, we can be (mostly) confident that a SOC version
+	 * will match a GPU (at this juncture at least).  So do the lazy/quick
+	 * thing and set the chip_id based on the SoC
 	 */
 
-	return pdata->chipid;
+	unsigned int version = socinfo_get_version();
+
+	if (cpu_is_apq8064()) {
+
+		/* A320 */
+		majorid = 2;
+		minorid = 0;
+
+		/*
+		 * V1.1 has some GPU work arounds that we need to communicate
+		 * up to user space via the patchid
+		 */
+
+		if ((SOCINFO_VERSION_MAJOR(version) == 1) &&
+			(SOCINFO_VERSION_MINOR(version) == 1))
+			patchid = 1;
+		else
+			patchid = 0;
+	} else if (cpu_is_msm8930() || cpu_is_msm8930aa() || cpu_is_msm8627()) {
+
+		/* A305 */
+		majorid = 0;
+		minorid = 5;
+
+		/*
+		 * V1.2 has some GPU work arounds that we need to communicate
+		 * up to user space via the patchid
+		 */
+
+		if ((SOCINFO_VERSION_MAJOR(version) == 1) &&
+			(SOCINFO_VERSION_MINOR(version) == 2))
+			patchid = 2;
+		else
+			patchid = 0;
+	}
+
+	return (0x03 << 24) | (majorid << 16) | (minorid << 8) | patchid;
 }
 
 static unsigned int
@@ -571,13 +622,7 @@ a2xx_getchipid(struct kgsl_device *device)
 {
 	unsigned int chipid = 0;
 	unsigned int coreid, majorid, minorid, patchid, revid;
-	struct kgsl_device_platform_data *pdata =
-		kgsl_device_get_drvdata(device);
-
-	/* If the chip id is set at the platform level, then just use that */
-
-	if (pdata->chipid != 0)
-		return pdata->chipid;
+	uint32_t soc_platform_version = socinfo_get_version();
 
 	adreno_regread(device, REG_RBBM_PERIPHID1, &coreid);
 	adreno_regread(device, REG_RBBM_PERIPHID2, &majorid);
@@ -587,7 +632,7 @@ a2xx_getchipid(struct kgsl_device *device)
 	* adreno 22x gpus are indicated by coreid 2,
 	* but REG_RBBM_PERIPHID1 always contains 0 for this field
 	*/
-	if (cpu_is_msm8x60())
+	if (cpu_is_msm8960() || cpu_is_msm8x60())
 		chipid = 2 << 24;
 	else
 		chipid = (coreid & 0xF) << 24;
@@ -599,9 +644,13 @@ a2xx_getchipid(struct kgsl_device *device)
 	patchid = ((revid >> 16) & 0xFF);
 
 	/* 8x50 returns 0 for patch release, but it should be 1 */
+	/* 8960v3 returns 5 for patch release, but it should be 6 */
 	/* 8x25 returns 0 for minor id, but it should be 1 */
 	if (cpu_is_qsd8x50())
 		patchid = 1;
+	else if (cpu_is_msm8960() &&
+			SOCINFO_VERSION_MAJOR(soc_platform_version) == 3)
+		patchid = 6;
 	else if (cpu_is_msm8625() && minorid == 0)
 		minorid = 1;
 
@@ -613,18 +662,11 @@ a2xx_getchipid(struct kgsl_device *device)
 static unsigned int
 adreno_getchipid(struct kgsl_device *device)
 {
-	struct kgsl_device_platform_data *pdata =
-		kgsl_device_get_drvdata(device);
-
-	/*
-	 * All A3XX chipsets will have pdata set, so assume !pdata->chipid is
-	 * an A2XX processor
-	 */
-
-	if (pdata->chipid == 0 || ADRENO_CHIPID_MAJOR(pdata->chipid) == 2)
-		return a2xx_getchipid(device);
-	else
+	if (cpu_is_apq8064() || cpu_is_msm8930() || cpu_is_msm8930aa() ||
+	    cpu_is_msm8627())
 		return a3xx_getchipid(device);
+	else
+		return a2xx_getchipid(device);
 }
 
 static inline bool _rev_match(unsigned int id, unsigned int entry)
@@ -639,10 +681,10 @@ adreno_identify_gpu(struct adreno_device *adreno_dev)
 
 	adreno_dev->chip_id = adreno_getchipid(&adreno_dev->dev);
 
-	core = ADRENO_CHIPID_CORE(adreno_dev->chip_id);
-	major = ADRENO_CHIPID_MAJOR(adreno_dev->chip_id);
-	minor = ADRENO_CHIPID_MINOR(adreno_dev->chip_id);
-	patchid = ADRENO_CHIPID_PATCH(adreno_dev->chip_id);
+	core = (adreno_dev->chip_id >> 24) & 0xff;
+	major = (adreno_dev->chip_id >> 16) & 0xff;
+	minor = (adreno_dev->chip_id >> 8) & 0xff;
+	patchid = (adreno_dev->chip_id & 0xff);
 
 	for (i = 0; i < ARRAY_SIZE(adreno_gpulist); i++) {
 		if (core == adreno_gpulist[i].core &&
@@ -1840,6 +1882,12 @@ static int adreno_setproperty(struct kgsl_device *device,
 	return status;
 }
 
+static inline void adreno_poke(struct kgsl_device *device)
+{
+	struct adreno_device *adreno_dev = ADRENO_DEVICE(device);
+	adreno_regwrite(device, REG_CP_RB_WPTR, adreno_dev->ringbuffer.wptr);
+}
+
 static int adreno_ringbuffer_drain(struct kgsl_device *device,
 	unsigned int *regs)
 {
@@ -1860,8 +1908,12 @@ static int adreno_ringbuffer_drain(struct kgsl_device *device,
 
 	wait = jiffies + msecs_to_jiffies(100);
 
+	adreno_poke(device);
+
 	do {
 		if (time_after(jiffies, wait)) {
+			adreno_poke(device);
+
 			/* Check to see if the core is hung */
 			if (adreno_hang_detect(device, regs))
 				return -ETIMEDOUT;
@@ -1970,6 +2022,7 @@ static unsigned int adreno_isidle(struct kgsl_device *device)
 	int status = false;
 	struct adreno_device *adreno_dev = ADRENO_DEVICE(device);
 	struct adreno_ringbuffer *rb = &adreno_dev->ringbuffer;
+	unsigned int rbbm_status;
 
 	WARN_ON(device->state == KGSL_STATE_INIT);
 	/* If the device isn't active, don't force it on. */
@@ -1978,7 +2031,17 @@ static unsigned int adreno_isidle(struct kgsl_device *device)
 		GSL_RB_GET_READPTR(rb, &rb->rptr);
 		if (!device->active_cnt && (rb->rptr == rb->wptr)) {
 			/* Is the core idle? */
-			status = is_adreno_rbbm_status_idle(device);
+			adreno_regread(device,
+				adreno_dev->gpudev->reg_rbbm_status,
+				&rbbm_status);
+
+			if (adreno_is_a2xx(adreno_dev)) {
+				if (rbbm_status == 0x110)
+					status = true;
+			} else {
+				if (!(rbbm_status & 0x80000000))
+					status = true;
+			}
 		}
 	} else {
 		status = true;
@@ -2229,8 +2292,9 @@ static int kgsl_check_interrupt_timestamp(struct kgsl_device *device,
 			cmds[1] = 0;
 
 			if (adreno_dev->drawctxt_active)
-				adreno_ringbuffer_issuecmds_intr(device,
-						context, &cmds[0], 2);
+				adreno_ringbuffer_issuecmds(device,
+					adreno_dev->drawctxt_active,
+					KGSL_CMD_FLAGS_NONE, &cmds[0], 2);
 			else
 				/* We would never call this function if there
 				 * was no active contexts running */
@@ -2427,6 +2491,11 @@ static int adreno_waittimestamp(struct kgsl_device *device,
 		 */
 
 		if (kgsl_check_timestamp(device, context, timestamp)) {
+			/* if the timestamp happens while we're not
+			 * waiting, there's a chance that an interrupt
+			 * will not be generated and thus the timestamp
+			 * work needs to be queued.
+			 */
 			queue_work(device->work_queue, &device->ts_expired_ws);
 			ret = 0;
 			break;
