@@ -33,7 +33,6 @@
 #include "z180.h"
 
 
-
 struct remote_iommu_petersons_spinlock kgsl_iommu_sync_lock_vars;
 
 static struct kgsl_iommu_unit *get_iommu_unit(struct device *dev)
@@ -544,7 +543,7 @@ static int kgsl_iommu_init_sync_lock(struct kgsl_mmu *mmu)
 
 	if (status) {
 		kgsl_mmu_unmap(pagetable, &iommu->sync_lock_desc);
-		iommu->sync_lock_desc.priv &= ~KGSL_MEMFLAGS_GLOBAL;
+		iommu->sync_lock_desc.priv &= ~~KGSL_MEMFLAGS_GLOBAL;
 		return status;
 	}
 
@@ -1072,6 +1071,7 @@ static void kgsl_iommu_stop(struct kgsl_mmu *mmu)
 	 */
 
 	if (mmu->flags & KGSL_FLAGS_STARTED) {
+		kgsl_regwrite(mmu->device, MH_MMU_CONFIG, 0x00000000);
 		/* detach iommu attachment */
 		kgsl_detach_pagetable_iommu_domain(mmu);
 		mmu->hwpagetable = NULL;
@@ -1166,8 +1166,7 @@ static void kgsl_iommu_default_setstate(struct kgsl_mmu *mmu,
 	msm_iommu_lock();
 
 	if (flags & KGSL_MMUFLAGS_PTUPDATE) {
-		if (!msm_soc_version_supports_iommu_v1())
-			kgsl_idle(mmu->device);
+		kgsl_idle(mmu->device);
 		for (i = 0; i < iommu->unit_count; i++) {
 			/* get the lsb value which should not change when
 			 * changing ttbr0 */
