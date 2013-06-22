@@ -900,6 +900,17 @@ config MACH_FSM9XXX_SURF
 
 endmenu
 
+config RAMDUMP_TAGS
+	bool
+	default y
+	help
+
+
+config AMSS_LASTLOG
+	bool
+	default y
+	help
+
 config MSM_STACKED_MEMORY
 	bool "Stacked Memory"
 	default y

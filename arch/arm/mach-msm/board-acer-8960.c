@@ -105,6 +105,10 @@
 
 #include <linux/nfc/pn544.h>
 
+#ifdef CONFIG_RAMDUMP_TAGS
+#include "board-rdtags.h"
+#endif
+
 static struct platform_device msm_fm_platform_init = {
 	.name = "iris_fm",
 	.id   = -1,
